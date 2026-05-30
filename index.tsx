@@ -205,7 +205,6 @@ let cachedProfile: ProfileData = { ...DEFAULT_PROFILE };
 const remoteProfiles = new Map<string, ProfileData>();
 const mergedProfileCache = new Map<string, { input: UserProfile; merged: UserProfile; }>();
 const mergedGuildProfileCache = new Map<string, { input: UserProfile; merged: UserProfile; }>();
-let customAccountDate: number | null = null;
 let profileOwnerId: string | null = null;
 let syncIntervalId: ReturnType<typeof setInterval> | null = null;
 let originalExtractTimestamp: ((id: string) => number) | null = null;
@@ -328,6 +327,7 @@ async function fetchRemoteProfiles() {
             remoteProfiles.set(id, normalizeProfileData(raw));
         }
         invalidateProfileCaches();
+        updateRuntimeHooks();
     } catch (e) {
         console.error("[CustomProfiles] fetch failed", e);
     }
@@ -491,10 +491,9 @@ function getBaseUser(user: User | null | undefined): User | null | undefined {
 
 function mergeUser(user: User | null | undefined): User | null | undefined {
     if (!user) return user;
-    if (!profileOwnerId || String(user.id) !== profileOwnerId) return user;
 
-    const profile = cachedProfile;
-    if (!profile || !isEnabled()) return user;
+    const profile = getEffectiveProfile(user.id);
+    if (!profile) return user;
 
     const changes: Record<string, unknown> = {};
     if (profile.globalName) changes.globalName = profile.globalName;
@@ -905,9 +904,8 @@ function applyAccountDatePatch() {
     if (originalExtractTimestamp) return;
     originalExtractTimestamp = SnowflakeUtils.extractTimestamp.bind(SnowflakeUtils);
     SnowflakeUtils.extractTimestamp = (id: string) => {
-        if (customAccountDate != null && profileOwnerId && String(id) === profileOwnerId) {
-            return customAccountDate;
-        }
+        const spoofed = getEffectiveProfile(id)?.accountDate;
+        if (spoofed != null) return spoofed;
         return originalExtractTimestamp!(id);
     };
 }
@@ -927,9 +925,17 @@ function invalidateProfileCaches() {
     mergedGuildProfileCache.clear();
 }
 
+function hasAnyAccountDateOverride(): boolean {
+    if (profileOwnerId && isEnabled() && cachedProfile.accountDate != null) return true;
+    for (const profile of remoteProfiles.values()) {
+        if (profile.enabled !== false && profile.accountDate != null) return true;
+    }
+    return false;
+}
+
 function updateRuntimeHooks() {
     try {
-        if (customAccountDate != null && isEnabled()) applyAccountDatePatch();
+        if (hasAnyAccountDateOverride()) applyAccountDatePatch();
         else removeAccountDatePatch();
 
         if (isEnabled()) syncPremiumOverride();
@@ -1234,7 +1240,6 @@ async function loadProfile() {
     profileOwnerId = String(currentUser.id);
     cachedProfile = await loadProfileData(profileOwnerId);
     invalidateProfileCaches();
-    customAccountDate = cachedProfile.accountDate;
     updateRuntimeHooks();
     registerCustomBadges();
     await fetchRemoteProfiles();
@@ -2000,7 +2005,6 @@ export default definePlugin({
         activeBadges.length = 0;
         remoteProfiles.clear();
         cachedProfile = { ...DEFAULT_PROFILE };
-        customAccountDate = null;
         profileOwnerId = null;
         avatarOverrideRevision = 0;
         removeAccountDatePatch();
