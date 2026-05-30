@@ -1,6 +1,6 @@
 # CustomProfiles
 
-Equicord userplugin. Local profile overrides (client-side only).
+Equicord userplugin. Local profile overrides (client-side and plugin-sided only.)
 
 Requires **BadgeAPI**. Settings: **Equicord → Plugins → CustomProfiles**.
 
@@ -39,3 +39,4 @@ $env:EQUICORD_PATH = "C:\path\to\Equicord"; .\install.ps1
 - `CustomBadges` data migrates on first load
 - Reload discord if avatar url change doesn't stick
 - Close discord before install if inject fails
+- When trying to vist the Plugins menu, If you experience a crash, Try to delete everything in the CustomProfiles folder, Except for index.tsx. After that run ```pnpm build``` and if you havent already. ```pnpm inject```
