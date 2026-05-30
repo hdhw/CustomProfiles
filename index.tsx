@@ -7,8 +7,8 @@ import { openModal, ModalRoot, ModalHeader, ModalContent, ModalFooter, ModalClos
 import { isPluginEnabled } from "@api/PluginManager";
 import definePlugin, { OptionType } from "@utils/types";
 import { User, UserProfile } from "@vencord/discord-types";
-import type { AvatarDecorationData, ClanData, DisplayNameStyles, Nameplate, ProfileEffect } from "@vencord/discord-types";
-import { Button, ColorPicker, Forms, GuildMemberStore, IconUtils, OverridePremiumTypeStore, React, SnowflakeUtils, UserStore } from "@webpack/common";
+import type { AvatarDecorationData, ClanData, DisplayNameStyles, DisplayProfile, Nameplate, ProfileEffect } from "@vencord/discord-types";
+import { Button, ColorPicker, DisplayProfileUtils, Forms, GuildMemberStore, IconUtils, OverridePremiumTypeStore, React, SnowflakeUtils, UserStore, UsernameUtils } from "@webpack/common";
 
 const STORE_KEY_PREFIX = "CustomProfiles_data";
 const LEGACY_STORE_KEY_PREFIX = "CustomBadges_data";
@@ -238,6 +238,15 @@ let patchedUserClass: {
 } | null = null;
 let tagPatchedUserClass: { prototype: object; } | null = null;
 let originalUserTagGetter: ((this: User) => string) | null = null;
+let createdAtPatchedUserClass: { prototype: object; } | null = null;
+let originalUserCreatedAtGetter: ((this: User) => Date) | null = null;
+let usernameUtilsPatched = false;
+let originalGetGlobalName: ((user: User) => string) | null = null;
+let originalGetName: ((user: User) => string) | null = null;
+let originalGetFormattedName: ((user: User, useTagInsteadOfUsername?: boolean) => string) | null = null;
+let displayProfileUtilsPatched = false;
+let originalGetDisplayProfile: ((userId: string, guildId?: string, customStores?: unknown) => DisplayProfile | null) | null = null;
+let originalUseDisplayProfile: ((userId: string, guildId?: string, customStores?: unknown) => DisplayProfile | null) | null = null;
 let cachedPremiumSince: Date | null = null;
 let cachedPremiumGuildSince: Date | null = null;
 let cachedPremiumSinceMs = -1;
@@ -774,6 +783,159 @@ function removeUserTagPatch() {
     originalUserTagGetter = null;
 }
 
+function applyUserCreatedAtPatch() {
+    if (createdAtPatchedUserClass) return;
+
+    try {
+        const UserClass = getUserClass();
+        const proto = UserClass?.prototype;
+        if (!proto || typeof proto !== "object") return;
+
+        const desc = Object.getOwnPropertyDescriptor(proto, "createdAt");
+        if (!desc?.get) return;
+
+        createdAtPatchedUserClass = UserClass;
+        originalUserCreatedAtGetter = desc.get as (this: User) => Date;
+
+        Object.defineProperty(proto, "createdAt", {
+            get(this: User) {
+                const spoofed = getEffectiveProfile(this.id)?.accountDate;
+                if (spoofed != null) return new Date(spoofed);
+                return originalUserCreatedAtGetter!.call(this);
+            },
+            configurable: true,
+            enumerable: desc.enumerable,
+        });
+    } catch (e) {
+        console.error("[CustomProfiles] createdAt patch skipped", e);
+    }
+}
+
+function removeUserCreatedAtPatch() {
+    if (!createdAtPatchedUserClass || !originalUserCreatedAtGetter) return;
+
+    Object.defineProperty(createdAtPatchedUserClass.prototype, "createdAt", {
+        get: originalUserCreatedAtGetter,
+        configurable: true,
+    });
+
+    createdAtPatchedUserClass = null;
+    originalUserCreatedAtGetter = null;
+}
+
+function applyUsernameUtilsPatches() {
+    if (usernameUtilsPatched) return;
+    if (!UsernameUtils?.getGlobalName) return;
+
+    try {
+        originalGetGlobalName = UsernameUtils.getGlobalName.bind(UsernameUtils);
+        UsernameUtils.getGlobalName = (user: User) => {
+            const spoofed = getEffectiveProfile(user?.id)?.globalName;
+            if (spoofed) return spoofed;
+            return originalGetGlobalName!(user);
+        };
+
+        if (UsernameUtils.getName) {
+            originalGetName = UsernameUtils.getName.bind(UsernameUtils);
+            UsernameUtils.getName = (user: User) => {
+                const profile = getEffectiveProfile(user?.id);
+                if (profile?.globalName) return profile.globalName;
+                if (profile?.username) return profile.username;
+                return originalGetName!(user);
+            };
+        }
+
+        if (UsernameUtils.getFormattedName) {
+            originalGetFormattedName = UsernameUtils.getFormattedName.bind(UsernameUtils);
+            UsernameUtils.getFormattedName = (user: User, useTagInsteadOfUsername?: boolean) => {
+                const profile = getEffectiveProfile(user?.id);
+                if (profile?.globalName) return profile.globalName;
+                if (profile?.username && useTagInsteadOfUsername) return profile.username;
+                return originalGetFormattedName!(user, useTagInsteadOfUsername);
+            };
+        }
+
+        usernameUtilsPatched = true;
+    } catch (e) {
+        console.error("[CustomProfiles] UsernameUtils patch skipped", e);
+    }
+}
+
+function removeUsernameUtilsPatches() {
+    if (!usernameUtilsPatched) return;
+
+    if (UsernameUtils) {
+        if (originalGetGlobalName) UsernameUtils.getGlobalName = originalGetGlobalName;
+        if (originalGetName) UsernameUtils.getName = originalGetName;
+        if (originalGetFormattedName) UsernameUtils.getFormattedName = originalGetFormattedName;
+    }
+
+    originalGetGlobalName = null;
+    originalGetName = null;
+    originalGetFormattedName = null;
+    usernameUtilsPatched = false;
+}
+
+function mergeDisplayProfile(profile: DisplayProfile | null, userId: string | undefined | null): DisplayProfile | null {
+    if (!profile || !userId) return profile;
+
+    const data = getEffectiveProfile(userId);
+    if (!data) return profile;
+
+    const changes: Record<string, unknown> = {};
+    if (data.bio) changes.bio = data.bio;
+    if (data.pronouns) changes.pronouns = data.pronouns;
+    if (data.themeColors) changes.themeColors = data.themeColors;
+    if (data.accentColor != null) changes.accentColor = data.accentColor;
+
+    const effect = buildProfileEffect(data.profileEffect);
+    if (effect) changes.profileEffect = effect;
+
+    if (data.bannerUrl) {
+        changes.getBannerURL = (options?: { canAnimate?: boolean; size?: number; }) =>
+            applyMediaUrl(data.bannerUrl!, options?.canAnimate ?? true, options?.size);
+        changes.getPreviewBanner = (_banner: string | null, canAnimate?: boolean, size?: number) =>
+            applyMediaUrl(data.bannerUrl!, canAnimate ?? true, size);
+    }
+
+    if (Object.keys(changes).length === 0) return profile;
+    return createOverlay(profile, changes) as DisplayProfile;
+}
+
+function applyDisplayProfileUtilsPatches() {
+    if (displayProfileUtilsPatched) return;
+    if (!DisplayProfileUtils?.getDisplayProfile) return;
+
+    try {
+        originalGetDisplayProfile = DisplayProfileUtils.getDisplayProfile.bind(DisplayProfileUtils);
+        DisplayProfileUtils.getDisplayProfile = (userId: string, guildId?: string, customStores?: unknown) =>
+            mergeDisplayProfile(originalGetDisplayProfile!(userId, guildId, customStores), userId);
+
+        if (DisplayProfileUtils.useDisplayProfile) {
+            originalUseDisplayProfile = DisplayProfileUtils.useDisplayProfile.bind(DisplayProfileUtils);
+            DisplayProfileUtils.useDisplayProfile = (userId: string, guildId?: string, customStores?: unknown) =>
+                mergeDisplayProfile(originalUseDisplayProfile!(userId, guildId, customStores), userId);
+        }
+
+        displayProfileUtilsPatched = true;
+    } catch (e) {
+        console.error("[CustomProfiles] DisplayProfileUtils patch skipped", e);
+    }
+}
+
+function removeDisplayProfileUtilsPatches() {
+    if (!displayProfileUtilsPatched) return;
+
+    if (DisplayProfileUtils) {
+        if (originalGetDisplayProfile) DisplayProfileUtils.getDisplayProfile = originalGetDisplayProfile;
+        if (originalUseDisplayProfile) DisplayProfileUtils.useDisplayProfile = originalUseDisplayProfile;
+    }
+
+    originalGetDisplayProfile = null;
+    originalUseDisplayProfile = null;
+    displayProfileUtilsPatched = false;
+}
+
 function applyUserAvatarMethodPatch() {
 }
 
@@ -797,6 +959,9 @@ function initRuntimePatches() {
     applyUserStorePatches();
     applyIconUtilsAvatarPatches();
     applyUserTagPatch();
+    applyUserCreatedAtPatch();
+    applyUsernameUtilsPatches();
+    applyDisplayProfileUtilsPatches();
     applyUserAvatarMethodPatch();
 }
 
@@ -1147,33 +1312,7 @@ function profileHook(user: UserProfile) {
 }
 
 function guildProfileHook(profile: UserProfile) {
-    const userId = profile?.userId ? String(profile.userId) : null;
-    const data = getEffectiveProfile(userId);
-    if (!data) return profile;
-
-    const cacheKey = userId!;
-    const cached = mergedGuildProfileCache.get(cacheKey);
-    if (cached?.input === profile) return cached.merged;
-
-    const changes: Partial<UserProfile> = {};
-    if (data.bio && profile.bio !== data.bio) changes.bio = data.bio;
-    if (data.pronouns && profile.pronouns !== data.pronouns) {
-        changes.pronouns = data.pronouns;
-    }
-
-    const effect = buildProfileEffect(data.profileEffect);
-    if (effect && profile.profileEffect?.skuId !== effect.skuId) {
-        changes.profileEffect = effect;
-    }
-
-    if (Object.keys(changes).length === 0) {
-        mergedGuildProfileCache.set(cacheKey, { input: profile, merged: profile });
-        return profile;
-    }
-
-    const merged = createOverlay(profile, changes as Record<string, unknown>);
-    mergedGuildProfileCache.set(cacheKey, { input: profile, merged });
-    return merged;
+    return profileHook(profile);
 }
 
 function getOwnAvatarDecoration(user?: User | null) {
@@ -2010,6 +2149,9 @@ export default definePlugin({
         removeAccountDatePatch();
         removeUserStorePatches();
         removeUserTagPatch();
+        removeUserCreatedAtPatch();
+        removeUsernameUtilsPatches();
+        removeDisplayProfileUtilsPatches();
         removeIconUtilsAvatarPatches();
         removeUserAvatarMethodPatch();
         clearPremiumOverride();
