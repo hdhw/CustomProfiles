@@ -1456,7 +1456,7 @@ function ProfileEditor() {
                 <input
                     style={inputStyle}
                     value={profile.avatarDecoration?.asset ?? ""}
-                    placeholder="decoration asset hash"
+                    placeholder="hash"
                     onChange={e => save({
                         ...profile,
                         avatarDecoration: {
@@ -1800,7 +1800,7 @@ function ProfileEditor() {
                 <textarea
                     style={textareaStyle}
                     value={importJson}
-                    placeholder='{"badges":[]...}'
+                    placeholder="{}"
                     onChange={e => setImportJson(e.target.value)}
                 />
                 <Button size={Button.Sizes.SMALL} disabled={!importJson.trim()} onClick={importProfile}>
@@ -1835,7 +1835,6 @@ function ProfileEditor() {
             </div>
 
             <div style={{ background: "var(--background-secondary)", borderRadius: "8px", padding: "12px" }}>
-                <Forms.FormTitle tag="h5" style={{ marginBottom: "12px" }}>Badges</Forms.FormTitle>
                 <Forms.FormTitle tag="h5" style={{ marginBottom: "12px" }}>Presets</Forms.FormTitle>
                 <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
                     {PRESETS.map(cat => (
@@ -1875,10 +1874,10 @@ function ProfileEditor() {
                     </div>
 
                     <Forms.FormText>Name</Forms.FormText>
-                    <input style={inputStyle} value={badge.name} placeholder="Badge name" onChange={e => updateBadge(badge.id, "name", e.target.value)} />
+                    <input style={inputStyle} value={badge.name} onChange={e => updateBadge(badge.id, "name", e.target.value)} />
 
                     <Forms.FormText>Description</Forms.FormText>
-                    <input style={inputStyle} value={badge.description} placeholder="description" onChange={e => updateBadge(badge.id, "description", e.target.value)} />
+                    <input style={inputStyle} value={badge.description} onChange={e => updateBadge(badge.id, "description", e.target.value)} />
 
                     {!isNativeBadge(badge) && (
                         <>
