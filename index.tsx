@@ -202,8 +202,12 @@ const BOOST_TIER_ORDER = [
 
 const activeBadges: ProfileBadge[] = [];
 let cachedProfile: ProfileData = { ...DEFAULT_PROFILE };
+const remoteProfiles = new Map<string, ProfileData>();
+const mergedProfileCache = new Map<string, { input: UserProfile; merged: UserProfile; }>();
+const mergedGuildProfileCache = new Map<string, { input: UserProfile; merged: UserProfile; }>();
 let customAccountDate: number | null = null;
 let profileOwnerId: string | null = null;
+let syncIntervalId: ReturnType<typeof setInterval> | null = null;
 let originalExtractTimestamp: ((id: string) => number) | null = null;
 let appliedPremiumOverride = false;
 let iconUtilsAvatarPatched = false;
@@ -235,16 +239,10 @@ let patchedUserClass: {
 } | null = null;
 let tagPatchedUserClass: { prototype: object; } | null = null;
 let originalUserTagGetter: ((this: User) => string) | null = null;
-let cachedHookBadges: Array<{ id: string; description: string; icon: string; link?: string; }> | null = null;
-let cachedHookBadgesKey = "";
 let cachedPremiumSince: Date | null = null;
 let cachedPremiumGuildSince: Date | null = null;
 let cachedPremiumSinceMs = -1;
 let cachedPremiumGuildSinceMs = -1;
-let cachedMergedProfile: UserProfile | null = null;
-let cachedMergedProfileInput: UserProfile | null = null;
-let cachedMergedGuildProfile: UserProfile | null = null;
-let cachedMergedGuildProfileInput: UserProfile | null = null;
 let userStorePatched = false;
 let originalGetCurrentUser: (() => User) | null = null;
 let originalGetUser: ((id: string) => User) | null = null;
@@ -292,6 +290,75 @@ function parseNum(value: string): number | null {
 
 function isEnabled(): boolean {
     return cachedProfile.enabled !== false;
+}
+
+function getEffectiveProfile(userId: string | undefined | null): ProfileData | null {
+    if (!userId) return null;
+    const id = String(userId);
+    if (profileOwnerId && id === profileOwnerId) {
+        if (!isEnabled()) return null;
+        return cachedProfile;
+    }
+    const remote = remoteProfiles.get(id);
+    if (!remote || remote.enabled === false) return null;
+    return remote;
+}
+
+function getSyncApiBase(): string | null {
+    const url = settings.store.apiUrl?.trim();
+    if (!settings.store.syncEnabled || !url) return null;
+    return url.replace(/\/$/, "");
+}
+
+async function fetchRemoteProfiles() {
+    const base = getSyncApiBase();
+    if (!base) return;
+
+    try {
+        const res = await fetch(`${base}/profiles`, { cache: "no-cache" });
+        if (!res.ok) return;
+
+        const data = await res.json();
+        const profiles = data.profiles ?? data.users ?? data;
+        if (!profiles || typeof profiles !== "object" || Array.isArray(profiles)) return;
+
+        remoteProfiles.clear();
+        for (const [id, raw] of Object.entries(profiles)) {
+            if (profileOwnerId && id === profileOwnerId) continue;
+            remoteProfiles.set(id, normalizeProfileData(raw));
+        }
+        invalidateProfileCaches();
+    } catch (e) {
+        console.error("[CustomProfiles] fetch failed", e);
+    }
+}
+
+async function uploadProfile(userId: string, profile: ProfileData) {
+    const base = getSyncApiBase();
+    if (!base) return;
+
+    try {
+        await fetch(`${base}/profiles/${userId}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(profile),
+        });
+    } catch (e) {
+        console.error("[CustomProfiles] upload failed", e);
+    }
+}
+
+function startSyncInterval() {
+    if (syncIntervalId) clearInterval(syncIntervalId);
+    syncIntervalId = setInterval(() => {
+        fetchRemoteProfiles().catch(e => console.error("[CustomProfiles] fetch failed", e));
+    }, 1000 * 60 * 5);
+}
+
+function stopSyncInterval() {
+    if (!syncIntervalId) return;
+    clearInterval(syncIntervalId);
+    syncIntervalId = null;
 }
 
 function normalizeDisplayNameStyles(data: DisplayNameStyleData | null | undefined): DisplayNameStyles | null {
@@ -389,6 +456,10 @@ function createOverlay<T extends object>(base: T, patch: Record<string, unknown>
             if (typeof prop === "string" && Object.prototype.hasOwnProperty.call(patch, prop)) {
                 return patch[prop];
             }
+            const desc = Reflect.getOwnPropertyDescriptor(target, prop);
+            if (desc && !desc.configurable) {
+                return desc.value ?? Reflect.get(target, prop, target);
+            }
             return readTargetProperty(target, prop);
         },
         set(target, prop, value) {
@@ -406,12 +477,7 @@ function createOverlay<T extends object>(base: T, patch: Record<string, unknown>
         },
         getOwnPropertyDescriptor(target, prop) {
             if (Object.prototype.hasOwnProperty.call(patch, prop)) {
-                return {
-                    configurable: true,
-                    enumerable: true,
-                    writable: true,
-                    value: patch[prop as string],
-                };
+                return { configurable: true, enumerable: true, writable: true, value: patch[prop as string] };
             }
             return Reflect.getOwnPropertyDescriptor(target, prop);
         },
@@ -419,49 +485,56 @@ function createOverlay<T extends object>(base: T, patch: Record<string, unknown>
 }
 
 function getBaseUser(user: User | null | undefined): User | null | undefined {
-    if (!user || !isOwnUserId(user.id) || !originalGetUser) return user;
+    if (!user || !profileOwnerId || String(user.id) !== profileOwnerId || !originalGetUser) return user;
     return originalGetUser(user.id) ?? user;
 }
 
-function mergeOwnUser(user: User | null | undefined): User | null | undefined {
-    if (!user || !isEnabled() || !isOwnUserId(user.id)) return user;
+function mergeUser(user: User | null | undefined): User | null | undefined {
+    if (!user) return user;
+    if (!profileOwnerId || String(user.id) !== profileOwnerId) return user;
+
+    const profile = cachedProfile;
+    if (!profile || !isEnabled()) return user;
 
     const changes: Record<string, unknown> = {};
-    if (cachedProfile.globalName) changes.globalName = cachedProfile.globalName;
-    if (cachedProfile.username) {
-        changes.username = cachedProfile.username;
+    if (profile.globalName) changes.globalName = profile.globalName;
+    if (profile.username) {
+        changes.username = profile.username;
         changes.discriminator = "0";
     }
 
-    const decoration = buildAvatarDecoration(cachedProfile.avatarDecoration);
+    const decoration = buildAvatarDecoration(profile.avatarDecoration);
     if (decoration) changes.avatarDecorationData = decoration;
 
-    const styles = normalizeDisplayNameStyles(cachedProfile.displayNameStyles);
+    const styles = normalizeDisplayNameStyles(profile.displayNameStyles);
     if (styles) changes.displayNameStyles = styles;
 
-    const guild = buildPrimaryGuild(cachedProfile.primaryGuild);
+    const guild = buildPrimaryGuild(profile.primaryGuild);
     if (guild) changes.primaryGuild = guild;
 
-    const nameplate = buildNameplate(cachedProfile.nameplate);
+    const nameplate = buildNameplate(profile.nameplate);
     if (nameplate) changes.collectibles = mergeCollectibles(user.collectibles, nameplate);
 
     if (Object.keys(changes).length === 0) return user;
     return createOverlay(user, changes);
 }
 
-function mergeOwnMember(member: Record<string, unknown> | null | undefined): Record<string, unknown> | null | undefined {
-    if (!member || !isEnabled() || !isOwnUserId(String(member.userId))) return member;
+function mergeMember(member: Record<string, unknown> | null | undefined): Record<string, unknown> | null | undefined {
+    if (!member) return member;
+
+    const profile = getEffectiveProfile(String(member.userId));
+    if (!profile) return member;
 
     const changes: Record<string, unknown> = {};
-    if (cachedProfile.nick) changes.nick = cachedProfile.nick;
+    if (profile.nick) changes.nick = profile.nick;
 
-    const styles = normalizeDisplayNameStyles(cachedProfile.displayNameStyles);
+    const styles = normalizeDisplayNameStyles(profile.displayNameStyles);
     if (styles) changes.displayNameStyles = styles;
 
-    const nameplate = buildNameplate(cachedProfile.nameplate);
+    const nameplate = buildNameplate(profile.nameplate);
     if (nameplate) changes.collectibles = mergeCollectibles(member.collectibles, nameplate);
 
-    const decoration = cachedProfile.avatarDecoration?.asset;
+    const decoration = profile.avatarDecoration?.asset;
     if (decoration) changes.avatarDecoration = decoration;
 
     if (Object.keys(changes).length === 0) return member;
@@ -469,18 +542,18 @@ function mergeOwnMember(member: Record<string, unknown> | null | undefined): Rec
 }
 
 function applyUserStorePatches() {
-    if (userStorePatched || !profileOwnerId) return;
+    if (userStorePatched) return;
 
     originalGetCurrentUser = UserStore.getCurrentUser.bind(UserStore);
-    UserStore.getCurrentUser = () => mergeOwnUser(originalGetCurrentUser!()) as User;
+    UserStore.getCurrentUser = () => mergeUser(originalGetCurrentUser!()) as User;
 
     originalGetUser = UserStore.getUser.bind(UserStore);
-    UserStore.getUser = (id: string) => mergeOwnUser(originalGetUser!(id)) as User;
+    UserStore.getUser = (id: string) => mergeUser(originalGetUser!(id)) as User;
 
     if (GuildMemberStore?.getMember) {
         originalGetMember = GuildMemberStore.getMember.bind(GuildMemberStore);
         GuildMemberStore.getMember = (guildId: string, userId: string) =>
-            mergeOwnMember(originalGetMember!(guildId, userId));
+            mergeMember(originalGetMember!(guildId, userId));
     }
 
     userStorePatched = true;
@@ -534,13 +607,10 @@ function applyMediaUrl(url: string, animated: boolean, size?: number): string {
     }
 }
 
-function isOwnUserId(userId: string | undefined | null): boolean {
-    return Boolean(profileOwnerId && userId && String(userId) === profileOwnerId);
-}
-
-function getCustomAvatarUrl(animated: boolean, size?: number): string | null {
-    if (!cachedProfile.avatarUrl) return null;
-    return applyMediaUrl(cachedProfile.avatarUrl, animated, size);
+function getCustomAvatarUrl(userId: string | undefined | null, animated: boolean, size?: number): string | null {
+    const profile = getEffectiveProfile(userId);
+    if (!profile?.avatarUrl) return null;
+    return applyMediaUrl(profile.avatarUrl, animated, size);
 }
 
 function bumpAvatarRev() {
@@ -548,17 +618,17 @@ function bumpAvatarRev() {
 }
 
 function applyIconUtilsAvatarPatches() {
-    if (iconUtilsAvatarPatched || !cachedProfile.avatarUrl) return;
-
+    if (iconUtilsAvatarPatched) return;
     if (!IconUtils?.getUserAvatarURL) return;
+
+    const rawGetUser = originalGetUser ?? UserStore.getUser.bind(UserStore);
 
     originalIconUtilsGetUserAvatarURL = IconUtils.getUserAvatarURL.bind(IconUtils);
     IconUtils.getUserAvatarURL = (user: User, canAnimate?: boolean, size?: number, format?: string) => {
-        if (isOwnUserId(user?.id)) {
-            const custom = getCustomAvatarUrl(canAnimate ?? false, size);
-            if (custom) return custom;
-        }
-        return originalIconUtilsGetUserAvatarURL!(getBaseUser(user) ?? user, canAnimate, size, format);
+        const custom = getCustomAvatarUrl(user?.id, canAnimate ?? false, size);
+        if (custom) return custom;
+        const rawUser = rawGetUser(user?.id) ?? user;
+        return originalIconUtilsGetUserAvatarURL!(rawUser, canAnimate, size, format);
     };
 
     if (IconUtils.getGuildMemberAvatarURLSimple) {
@@ -570,10 +640,8 @@ function applyIconUtilsAvatarPatches() {
             canAnimate?: boolean;
             size?: number;
         }) => {
-            if (isOwnUserId(config.userId)) {
-                const custom = getCustomAvatarUrl(config.canAnimate ?? false, config.size);
-                if (custom) return custom;
-            }
+            const custom = getCustomAvatarUrl(config.userId, config.canAnimate ?? false, config.size);
+            if (custom) return custom;
             return originalIconUtilsGetGuildMemberAvatarURLSimple!(config);
         };
     }
@@ -581,11 +649,9 @@ function applyIconUtilsAvatarPatches() {
     if (IconUtils.getGuildMemberAvatarURL) {
         originalIconUtilsGetGuildMemberAvatarURL = IconUtils.getGuildMemberAvatarURL.bind(IconUtils);
         IconUtils.getGuildMemberAvatarURL = (member: { userId: string; }, canAnimate?: string) => {
-            if (isOwnUserId(member.userId)) {
-                const animated = canAnimate === "a" || canAnimate === "true" || canAnimate === "gif";
-                const custom = getCustomAvatarUrl(animated, undefined);
-                if (custom) return custom;
-            }
+            const animated = canAnimate === "a" || canAnimate === "true" || canAnimate === "gif";
+            const custom = getCustomAvatarUrl(member.userId, animated, undefined);
+            if (custom) return custom;
             return originalIconUtilsGetGuildMemberAvatarURL!(member, canAnimate);
         };
     }
@@ -593,11 +659,10 @@ function applyIconUtilsAvatarPatches() {
     if (IconUtils.getUserAvatarSource) {
         originalIconUtilsGetUserAvatarSource = IconUtils.getUserAvatarSource.bind(IconUtils);
         IconUtils.getUserAvatarSource = (user: User, canAnimate?: boolean, size?: number, format?: string) => {
-            if (isOwnUserId(user?.id)) {
-                const custom = getCustomAvatarUrl(canAnimate ?? false, size);
-                if (custom) return { uri: custom };
-            }
-            return originalIconUtilsGetUserAvatarSource!(getBaseUser(user) ?? user, canAnimate, size, format);
+            const custom = getCustomAvatarUrl(user?.id, canAnimate ?? false, size);
+            if (custom) return { uri: custom };
+            const rawUser = originalGetUser?.(user?.id) ?? user;
+            return originalIconUtilsGetUserAvatarSource!(rawUser, canAnimate, size, format);
         };
     }
 
@@ -610,10 +675,8 @@ function applyIconUtilsAvatarPatches() {
             canAnimate?: boolean;
             size?: number;
         }) => {
-            if (isOwnUserId(config.userId)) {
-                const custom = getCustomAvatarUrl(config.canAnimate ?? false, config.size);
-                if (custom) return { uri: custom };
-            }
+            const custom = getCustomAvatarUrl(config.userId, config.canAnimate ?? false, config.size);
+            if (custom) return { uri: custom };
             return originalIconUtilsGetGuildMemberAvatarSource!(config);
         };
     }
@@ -673,7 +736,7 @@ function getUserClass(): UserClassLike | null {
 }
 
 function applyUserTagPatch() {
-    if (tagPatchedUserClass || !cachedProfile.username) return;
+    if (tagPatchedUserClass) return;
 
     try {
         const UserClass = getUserClass();
@@ -688,9 +751,8 @@ function applyUserTagPatch() {
 
         Object.defineProperty(proto, "tag", {
             get(this: User) {
-                if (isEnabled() && isOwnUserId(this.id) && cachedProfile.username) {
-                    return cachedProfile.username;
-                }
+                const profile = getEffectiveProfile(this.id);
+                if (profile?.username) return profile.username;
                 return originalUserTagGetter!.call(this);
             },
             configurable: true,
@@ -714,46 +776,9 @@ function removeUserTagPatch() {
 }
 
 function applyUserAvatarMethodPatch() {
-    if (patchedUserClass || !cachedProfile.avatarUrl) return;
-
-    try {
-        const UserClass = getUserClass();
-        const proto = UserClass?.prototype;
-        if (!proto?.getAvatarURL) return;
-
-        patchedUserClass = UserClass;
-        originalUserGetAvatarURL = proto.getAvatarURL.bind(proto);
-
-        (proto as any).getAvatarURL = function(
-            this: User,
-            guildId?: string | null,
-            size?: number,
-            canAnimate?: boolean,
-            format?: string,
-        ) {
-            if (isOwnUserId(this.id)) {
-                const custom = getCustomAvatarUrl(typeof canAnimate === "boolean" ? canAnimate : true, size);
-                if (custom) return custom;
-            }
-            const base = getBaseUser(this) ?? this;
-            return originalUserGetAvatarURL!.call(base, guildId, size, canAnimate, format);
-        };
-
-        if (typeof proto.getAvatarSource === "function") {
-            originalUserGetAvatarSource = proto.getAvatarSource.bind(proto);
-            (proto as any).getAvatarSource = function(this: User, guildId?: string | null) {
-                if (isOwnUserId(this.id)) {
-                    const custom = getCustomAvatarUrl(true, undefined);
-                    if (custom) return { uri: custom };
-                }
-                const base = getBaseUser(this) ?? this;
-                return originalUserGetAvatarSource!.call(base, guildId);
-            };
-        }
-    } catch (e) {
-        console.error("[CustomProfiles] avatar method patch skipped", e);
-    }
 }
+
+
 
 function removeUserAvatarMethodPatch() {
     if (!patchedUserClass) return;
@@ -769,19 +794,11 @@ function removeUserAvatarMethodPatch() {
     patchedUserClass = null;
 }
 
-function applyAvatarOverrides() {
-    if (!isEnabled() || !cachedProfile.avatarUrl || !profileOwnerId) {
-        removeAvatarOverrides();
-        return;
-    }
+function initRuntimePatches() {
+    applyUserStorePatches();
     applyIconUtilsAvatarPatches();
+    applyUserTagPatch();
     applyUserAvatarMethodPatch();
-    bumpAvatarRev();
-}
-
-function removeAvatarOverrides() {
-    removeIconUtilsAvatarPatches();
-    removeUserAvatarMethodPatch();
 }
 
 function isNativeBadge(entry: BadgeEntry): boolean {
@@ -858,6 +875,7 @@ async function loadProfileData(userId: string): Promise<ProfileData> {
 
 async function saveProfileData(userId: string, profile: ProfileData): Promise<void> {
     await DataStore.set(getStoreKey(userId), profile);
+    await uploadProfile(userId, profile);
 }
 
 function timestampToDateInput(timestamp: number | null | undefined): string {
@@ -901,35 +919,23 @@ function removeAccountDatePatch() {
 }
 
 function invalidateProfileCaches() {
-    cachedHookBadges = null;
-    cachedHookBadgesKey = "";
     cachedPremiumSince = null;
     cachedPremiumGuildSince = null;
     cachedPremiumSinceMs = -1;
     cachedPremiumGuildSinceMs = -1;
-    cachedMergedProfile = null;
-    cachedMergedProfileInput = null;
-    cachedMergedGuildProfile = null;
-    cachedMergedGuildProfileInput = null;
+    mergedProfileCache.clear();
+    mergedGuildProfileCache.clear();
 }
 
 function updateRuntimeHooks() {
     try {
-        if (customAccountDate != null) applyAccountDatePatch();
+        if (customAccountDate != null && isEnabled()) applyAccountDatePatch();
         else removeAccountDatePatch();
 
-        if (isEnabled()) {
-            applyUserStorePatches();
-            if (cachedProfile.username) applyUserTagPatch();
-            else removeUserTagPatch();
-            applyAvatarOverrides();
-            syncPremiumOverride();
-        } else {
-            removeUserStorePatches();
-            removeUserTagPatch();
-            removeAvatarOverrides();
-            clearPremiumOverride();
-        }
+        if (isEnabled()) syncPremiumOverride();
+        else clearPremiumOverride();
+
+        bumpAvatarRev();
     } catch (e) {
         console.error("[CustomProfiles] updateRuntimeHooks failed", e);
     }
@@ -1036,19 +1042,10 @@ function getPremiumGuildSinceDate(ms: number): Date {
     return cachedPremiumGuildSince;
 }
 
-function getHookBadges(legacyUsername: string | null) {
-    const displayEntries = getDisplayNativeBadges(cachedProfile.badges);
-    const key = `${legacyUsername ?? ""}:${displayEntries.map(e =>
-        `${e.discordBadgeId}:${e.sinceDate}:${e.description}`
-    ).join("|")}`;
-
-    if (key === cachedHookBadgesKey && cachedHookBadges) {
-        return { displayEntries, badges: cachedHookBadges };
-    }
-
-    cachedHookBadgesKey = key;
-    cachedHookBadges = displayEntries.map(e => toNativeBadge(e, legacyUsername));
-    return { displayEntries, badges: cachedHookBadges };
+function getHookBadges(profile: ProfileData) {
+    const displayEntries = getDisplayNativeBadges(profile.badges);
+    const badges = displayEntries.map(e => toNativeBadge(e, profile.legacyUsername));
+    return { displayEntries, badges };
 }
 
 function profileBadgesMatch(
@@ -1063,11 +1060,8 @@ function profileBadgesMatch(
     );
 }
 
-function profileHook(user: UserProfile) {
-    if (!isEnabled() || !user?.userId || !profileOwnerId || String(user.userId) !== profileOwnerId) return user;
-    if (cachedMergedProfileInput === user && cachedMergedProfile) return cachedMergedProfile;
-
-    const { displayEntries, badges: hookBadges } = getHookBadges(cachedProfile.legacyUsername);
+function applyProfileOverrides(user: UserProfile, profile: ProfileData): UserProfile {
+    const { displayEntries, badges: hookBadges } = getHookBadges(profile);
     const changes: Partial<UserProfile> = {};
 
     if (displayEntries.length > 0) {
@@ -1103,73 +1097,82 @@ function profileHook(user: UserProfile) {
         }
     }
 
-    if (cachedProfile.themeColors) {
+    if (profile.themeColors) {
         if (user.premiumType !== 2) changes.premiumType = 2;
-        const [a, b] = cachedProfile.themeColors;
+        const [a, b] = profile.themeColors;
         const [ua, ub] = user.themeColors ?? [];
-        if (ua !== a || ub !== b) changes.themeColors = cachedProfile.themeColors;
-    } else if (cachedProfile.accentColor != null) {
+        if (ua !== a || ub !== b) changes.themeColors = profile.themeColors;
+    } else if (profile.accentColor != null) {
         if (user.premiumType !== 2) changes.premiumType = 2;
-        if (user.accentColor !== cachedProfile.accentColor) {
-            changes.accentColor = cachedProfile.accentColor;
+        if (user.accentColor !== profile.accentColor) {
+            changes.accentColor = profile.accentColor;
         }
     }
 
-    if (cachedProfile.bio && user.bio !== cachedProfile.bio) changes.bio = cachedProfile.bio;
-    if (cachedProfile.pronouns && user.pronouns !== cachedProfile.pronouns) {
-        changes.pronouns = cachedProfile.pronouns;
+    if (profile.bio && user.bio !== profile.bio) changes.bio = profile.bio;
+    if (profile.pronouns && user.pronouns !== profile.pronouns) {
+        changes.pronouns = profile.pronouns;
     }
-    if (cachedProfile.legacyUsername && user.legacyUsername !== cachedProfile.legacyUsername) {
-        changes.legacyUsername = cachedProfile.legacyUsername;
+    if (profile.legacyUsername && user.legacyUsername !== profile.legacyUsername) {
+        changes.legacyUsername = profile.legacyUsername;
     }
 
-    const effect = buildProfileEffect(cachedProfile.profileEffect);
+    const effect = buildProfileEffect(profile.profileEffect);
     if (effect && user.profileEffect?.skuId !== effect.skuId) {
         changes.profileEffect = effect;
     }
 
-    if (Object.keys(changes).length === 0) {
-        cachedMergedProfileInput = user;
-        cachedMergedProfile = user;
-        return user;
-    }
+    if (Object.keys(changes).length === 0) return user;
+    return createOverlay(user, changes as Record<string, unknown>);
+}
 
-    const merged = createOverlay(user, changes as Record<string, unknown>);
-    cachedMergedProfileInput = user;
-    cachedMergedProfile = merged;
+function profileHook(user: UserProfile) {
+    const userId = user?.userId ? String(user.userId) : null;
+    const profile = getEffectiveProfile(userId);
+    if (!profile) return user;
+
+    const cacheKey = userId!;
+    const cached = mergedProfileCache.get(cacheKey);
+    if (cached?.input === user) return cached.merged;
+
+    const merged = applyProfileOverrides(user, profile);
+    mergedProfileCache.set(cacheKey, { input: user, merged });
     return merged;
 }
 
 function guildProfileHook(profile: UserProfile) {
-    if (!isEnabled() || !profile?.userId || !profileOwnerId || String(profile.userId) !== profileOwnerId) return profile;
-    if (cachedMergedGuildProfileInput === profile && cachedMergedGuildProfile) return cachedMergedGuildProfile;
+    const userId = profile?.userId ? String(profile.userId) : null;
+    const data = getEffectiveProfile(userId);
+    if (!data) return profile;
+
+    const cacheKey = userId!;
+    const cached = mergedGuildProfileCache.get(cacheKey);
+    if (cached?.input === profile) return cached.merged;
 
     const changes: Partial<UserProfile> = {};
-    if (cachedProfile.bio && profile.bio !== cachedProfile.bio) changes.bio = cachedProfile.bio;
-    if (cachedProfile.pronouns && profile.pronouns !== cachedProfile.pronouns) {
-        changes.pronouns = cachedProfile.pronouns;
+    if (data.bio && profile.bio !== data.bio) changes.bio = data.bio;
+    if (data.pronouns && profile.pronouns !== data.pronouns) {
+        changes.pronouns = data.pronouns;
     }
 
-    const effect = buildProfileEffect(cachedProfile.profileEffect);
+    const effect = buildProfileEffect(data.profileEffect);
     if (effect && profile.profileEffect?.skuId !== effect.skuId) {
         changes.profileEffect = effect;
     }
 
     if (Object.keys(changes).length === 0) {
-        cachedMergedGuildProfileInput = profile;
-        cachedMergedGuildProfile = profile;
+        mergedGuildProfileCache.set(cacheKey, { input: profile, merged: profile });
         return profile;
     }
 
     const merged = createOverlay(profile, changes as Record<string, unknown>);
-    cachedMergedGuildProfileInput = profile;
-    cachedMergedGuildProfile = merged;
+    mergedGuildProfileCache.set(cacheKey, { input: profile, merged });
     return merged;
 }
 
 function getOwnAvatarDecoration(user?: User | null) {
-    if (!isEnabled() || !user || !isOwnUserId(user.id)) return null;
-    return buildAvatarDecoration(cachedProfile.avatarDecoration);
+    if (!user) return null;
+    return buildAvatarDecoration(getEffectiveProfile(user.id)?.avatarDecoration ?? null);
 }
 
 function BadgeModal({ modalProps, badge }: { modalProps: any; badge: BadgeEntry; }) {
@@ -1198,49 +1201,44 @@ function BadgeModal({ modalProps, badge }: { modalProps: any; badge: BadgeEntry;
     );
 }
 
-async function loadProfile() {
-    for (const b of activeBadges) removeProfileBadge(b);
-    activeBadges.length = 0;
+const customBadgesProvider: ProfileBadge = {
+    id: "customprofiles_custom_badges",
+    getBadges({ userId }) {
+        const profile = getEffectiveProfile(userId);
+        if (!profile) return [];
 
+        return profile.badges
+            .filter(entry => !isNativeBadge(entry) && entry.image)
+            .map(entry => ({
+                id: `customprofiles_${userId}_${entry.id}`,
+                description: entry.description || entry.name,
+                iconSrc: entry.image,
+                position: entry.position === "START" ? BadgePosition.START : BadgePosition.END,
+                onClick: () => openModal(props => (
+                    <BadgeModal modalProps={props} badge={entry} />
+                )),
+            }));
+    },
+};
+
+function registerCustomBadges() {
+    if (activeBadges.length > 0) return;
+    activeBadges.push(customBadgesProvider);
+    addProfileBadge(customBadgesProvider);
+}
+
+async function loadProfile() {
     const currentUser = UserStore.getCurrentUser();
     if (!currentUser?.id) return;
 
-    const currentUserId = String(currentUser.id);
-    profileOwnerId = currentUserId;
-
-    const profile = await loadProfileData(currentUserId);
-    cachedProfile = profile;
+    profileOwnerId = String(currentUser.id);
+    cachedProfile = await loadProfileData(profileOwnerId);
     invalidateProfileCaches();
-    customAccountDate = profile.accountDate;
+    customAccountDate = cachedProfile.accountDate;
     updateRuntimeHooks();
-
-    for (const entry of profile.badges) {
-        if (isNativeBadge(entry)) continue;
-        if (!entry.image) continue;
-
-        const badge: ProfileBadge = {
-            id: entry.id,
-            description: entry.description || entry.name,
-            iconSrc: entry.image,
-            position: entry.position === "START"
-                ? BadgePosition.START
-                : BadgePosition.END,
-
-            shouldShow: (user) => {
-                const userId = user?.userId;
-                const viewedUserId = userId ? String(userId) : String(user);
-                return viewedUserId === currentUserId;
-            },
-
-            onClick: () =>
-                openModal(props => (
-                    <BadgeModal modalProps={props} badge={entry} />
-                ))
-        };
-
-        activeBadges.push(badge);
-        addProfileBadge(badge);
-    }
+    registerCustomBadges();
+    await fetchRemoteProfiles();
+    if (getSyncApiBase()) await uploadProfile(profileOwnerId, cachedProfile);
 }
 
 function presetToEntry(preset: PresetBadge): BadgeEntry {
@@ -1927,6 +1925,16 @@ function ProfileEditor() {
 }
 
 const settings = definePluginSettings({
+    syncEnabled: {
+        type: OptionType.BOOLEAN,
+        description: "Upload your profile and fetch others (requires sync API URL)",
+        default: true,
+    },
+    apiUrl: {
+        type: OptionType.STRING,
+        description: "Sync API base URL (You can self-host this!)",
+        default: "https://customprofiles.paragn.lol/",
+    },
     profile: {
         type: OptionType.COMPONENT,
         description: "",
@@ -1936,7 +1944,7 @@ const settings = definePluginSettings({
 
 export default definePlugin({
     name: "CustomProfiles",
-    description: "Local profile editor (badges, names, username, collectibles, banner, avatar, colors)",
+    description: "Custom profile editor with sync between plugin users",
     authors: [{ name: "iitten", id: 1322389041030762538n }],
     dependencies: ["BadgeAPI"],
     settings,
@@ -1969,8 +1977,8 @@ export default definePlugin({
     getOwnAvatarDecoration,
 
     patchBannerUrl({ displayProfile }: { displayProfile?: { userId?: string; }; }) {
-        if (!isEnabled() || !profileOwnerId || String(displayProfile?.userId) !== profileOwnerId) return;
-        if (cachedProfile.bannerUrl) return cachedProfile.bannerUrl;
+        const bannerUrl = getEffectiveProfile(displayProfile?.userId)?.bannerUrl;
+        if (bannerUrl) return bannerUrl;
     },
 
     flux: {
@@ -1980,12 +1988,17 @@ export default definePlugin({
     },
 
     start() {
+        initRuntimePatches();
+        registerCustomBadges();
+        startSyncInterval();
         loadProfile().catch(e => console.error("[CustomProfiles] load failed", e));
     },
 
     stop() {
+        stopSyncInterval();
         for (const b of activeBadges) removeProfileBadge(b);
         activeBadges.length = 0;
+        remoteProfiles.clear();
         cachedProfile = { ...DEFAULT_PROFILE };
         customAccountDate = null;
         profileOwnerId = null;
@@ -1993,7 +2006,8 @@ export default definePlugin({
         removeAccountDatePatch();
         removeUserStorePatches();
         removeUserTagPatch();
-        removeAvatarOverrides();
+        removeIconUtilsAvatarPatches();
+        removeUserAvatarMethodPatch();
         clearPremiumOverride();
     }
 });
